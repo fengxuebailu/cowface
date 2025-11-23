@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Tuple, List, Dict
 import numpy as np
 from tqdm import tqdm
+from sklearn.model_selection import KFold
 
 import torch
 import torch.nn as nn
@@ -56,6 +57,10 @@ class Config:
     LEARNING_RATE = 0.01  # 学习率
     WEIGHT_DECAY = 5e-4
     VAL_SPLIT = 0.1  # 验证集比例
+
+    # K-Fold 参数
+    USE_KFOLD = True  # 是否使用 K-Fold 交叉验证
+    NUM_FOLDS = 5     # K-Fold 数量
 
     # 模型参数
     INPUT_SIZE = 224
@@ -894,6 +899,114 @@ def save_submission(predictions: np.ndarray,
 
 
 # ============================================================================
+# K-Fold 交叉验证
+# ============================================================================
+
+def train_with_kfold(train_dataset: CowTrainDataset,
+                     num_folds: int = 5) -> Tuple[List[nn.Module], List[float], float]:
+    """使用 K-Fold 交叉验证训练多个模型
+
+    Args:
+        train_dataset: 训练数据集
+        num_folds: 折数
+
+    Returns:
+        models: K 个训练好的模型列表
+        best_thresholds: 每个 Fold 的最佳阈值
+        ensemble_accuracy: 集成模型的最终准确率
+    """
+    print(f"\n[K-Fold 交叉验证] 使用 {num_folds}-Fold 训练...")
+
+    num_samples = len(train_dataset)
+    kfold = KFold(n_splits=num_folds, shuffle=True, random_state=Config.SEED)
+
+    models = []
+    best_thresholds = []
+    all_val_accuracies = []
+
+    # 获取所有样本的索引
+    all_indices = np.arange(num_samples)
+
+    for fold, (train_idx, val_idx) in enumerate(kfold.split(all_indices)):
+        print(f"\n[Fold {fold + 1}/{num_folds}]")
+        print(f"  训练样本: {len(train_idx)}, 验证样本: {len(val_idx)}")
+
+        # 创建当前 Fold 的训练和验证数据集
+        train_fold_dataset = CowTrainDataset(
+            root_dir=Config.TRAIN_DIR,
+            transform=get_train_transforms(Config.INPUT_SIZE),
+            indices=train_idx.tolist()
+        )
+
+        val_fold_dataset = CowTrainDataset(
+            root_dir=Config.TRAIN_DIR,
+            transform=get_test_transforms(Config.INPUT_SIZE),
+            indices=val_idx.tolist()
+        )
+
+        # 创建数据加载器
+        train_loader = DataLoader(
+            train_fold_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=True,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True
+        )
+
+        val_loader = DataLoader(
+            val_fold_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True
+        )
+
+        # 创建新模型
+        model = CowFaceModel(
+            num_classes=Config.NUM_CLASSES,
+            feature_dim=512,
+            pretrained=True
+        )
+
+        # 训练模型
+        model = train_model(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            model=model,
+            num_epochs=Config.NUM_EPOCHS,
+            device=Config.DEVICE
+        )
+
+        # 保存模型
+        model_path = Config.MODEL_SAVE_PATH / f'fold_{fold + 1}_model.pth'
+        Config.MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
+        model_to_save = model.module if hasattr(model, 'module') else model
+        torch.save(model_to_save.state_dict(), model_path)
+        print(f"  Fold {fold + 1} 模型已保存: {model_path}")
+
+        # 在验证集上提取特征并搜索阈值
+        model.eval()
+        val_features, _ = extract_features(model, val_loader, Config.DEVICE)
+        val_features = val_features / (np.linalg.norm(val_features, axis=1, keepdims=True) + 1e-8)
+
+        best_threshold, best_accuracy = search_best_threshold(val_fold_dataset, val_features)
+        best_thresholds.append(best_threshold)
+        all_val_accuracies.append(best_accuracy)
+
+        print(f"  Fold {fold + 1} - 最佳阈值: {best_threshold:.4f}, 验证准确率: {best_accuracy:.4f}")
+
+        models.append(model)
+
+    # 计算平均准确率
+    ensemble_accuracy = np.mean(all_val_accuracies)
+    print(f"\n[K-Fold 结果] 平均验证准确率: {ensemble_accuracy:.4f}")
+    print(f"  各 Fold 准确率: {[f'{acc:.4f}' for acc in all_val_accuracies]}")
+    print(f"  各 Fold 最佳阈值: {[f'{th:.4f}' for th in best_thresholds]}")
+
+    return models, best_thresholds, ensemble_accuracy
+
+
+# ============================================================================
 # 主程序
 # ============================================================================
 
@@ -915,6 +1028,7 @@ def main():
     print(f"  多卡并行: {Config.USE_MULTI_GPU}")
     print(f"  混合精度: {Config.USE_AMP}")
     print(f"  Batch Size: {Config.BATCH_SIZE}")
+    print(f"  K-Fold: {'是' if Config.USE_KFOLD else '否'}")
 
     # ========== 阶段 1：数据加载和训练 ==========
 
@@ -930,88 +1044,103 @@ def main():
     # 动态设置类别数
     Config.NUM_CLASSES = len(train_dataset.id_to_label)
     print(f"  牛的总数: {Config.NUM_CLASSES}")
+    print(f"  总图片数: {len(train_dataset)}")
 
-    # 划分训练/验证集
-    num_samples = len(train_dataset)
-    num_val = int(num_samples * Config.VAL_SPLIT)
-    num_train = num_samples - num_val
+    # 使用 K-Fold 或传统的单次训练
+    if Config.USE_KFOLD:
+        # K-Fold 交叉验证训练
+        models, best_thresholds, ensemble_accuracy = train_with_kfold(
+            train_dataset=train_dataset,
+            num_folds=Config.NUM_FOLDS
+        )
+        # 使用平均阈值
+        best_threshold = np.mean(best_thresholds)
+        best_accuracy = ensemble_accuracy
+    else:
+        # 传统的单次训练方式
+        num_samples = len(train_dataset)
+        num_val = int(num_samples * Config.VAL_SPLIT)
+        num_train = num_samples - num_val
 
-    indices = np.random.permutation(num_samples)
-    train_indices = indices[:num_train]
-    val_indices = indices[num_train:]
+        indices = np.random.permutation(num_samples)
+        train_indices = indices[:num_train]
+        val_indices = indices[num_train:]
 
-    # 创建具有数据增强的训练/验证数据集
-    train_dataset_augmented = CowTrainDataset(
-        root_dir=Config.TRAIN_DIR,
-        transform=get_train_transforms(Config.INPUT_SIZE),
-        indices=train_indices.tolist()
-    )
+        # 创建具有数据增强的训练/验证数据集
+        train_dataset_augmented = CowTrainDataset(
+            root_dir=Config.TRAIN_DIR,
+            transform=get_train_transforms(Config.INPUT_SIZE),
+            indices=train_indices.tolist()
+        )
 
-    val_dataset = CowTrainDataset(
-        root_dir=Config.TRAIN_DIR,
-        transform=get_test_transforms(Config.INPUT_SIZE),
-        indices=val_indices.tolist()
-    )
+        val_dataset = CowTrainDataset(
+            root_dir=Config.TRAIN_DIR,
+            transform=get_test_transforms(Config.INPUT_SIZE),
+            indices=val_indices.tolist()
+        )
 
-    # 创建数据加载器
-    train_loader = DataLoader(
-        train_dataset_augmented,
-        batch_size=Config.BATCH_SIZE,
-        shuffle=True,
-        num_workers=Config.NUM_WORKERS,
-        pin_memory=True
-    )
+        # 创建数据加载器
+        train_loader = DataLoader(
+            train_dataset_augmented,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=True,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True
+        )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=Config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=Config.NUM_WORKERS,
-        pin_memory=True
-    )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True
+        )
 
-    print(f"  训练集: {num_train} 张图片")
-    print(f"  验证集: {num_val} 张图片")
+        print(f"  训练集: {num_train} 张图片")
+        print(f"  验证集: {num_val} 张图片")
 
-    # 创建模型
-    print(f"\n  创建模型...")
-    model = CowFaceModel(
-        num_classes=Config.NUM_CLASSES,
-        feature_dim=512,
-        pretrained=True
-    )
-    print(f"  模型参数数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+        # 创建模型
+        print(f"\n  创建模型...")
+        model = CowFaceModel(
+            num_classes=Config.NUM_CLASSES,
+            feature_dim=512,
+            pretrained=True
+        )
+        print(f"  模型参数数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
-    # 训练模型
-    print(f"\n[阶段 1：训练模型]")
-    model = train_model(
-        train_loader=train_loader,
-        val_loader=val_loader,
-        model=model,
-        num_epochs=Config.NUM_EPOCHS,
-        device=Config.DEVICE
-    )
+        # 训练模型
+        print(f"\n[阶段 1：训练模型]")
+        model = train_model(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            model=model,
+            num_epochs=Config.NUM_EPOCHS,
+            device=Config.DEVICE
+        )
 
-    # ========== 阶段 2：阈值搜索 ==========
+        # ========== 阶段 2：阈值搜索 ==========
 
-    print(f"\n[阶段 2：阈值搜索]")
+        print(f"\n[阶段 2：阈值搜索]")
 
-    # 加载最佳模型
-    model_to_load = model.module if hasattr(model, 'module') else model
-    saved_state = torch.load(Config.CHECKPOINT_PATH, map_location=Config.DEVICE)
-    model_to_load.load_state_dict(saved_state)
-    model_to_load.eval()
+        # 加载最佳模型
+        model_to_load = model.module if hasattr(model, 'module') else model
+        saved_state = torch.load(Config.CHECKPOINT_PATH, map_location=Config.DEVICE)
+        model_to_load.load_state_dict(saved_state)
+        model_to_load.eval()
 
-    # 提取验证集特征
-    print(f"  提取验证集特征...")
-    val_features, _ = extract_features(model_to_load, val_loader, Config.DEVICE)
+        # 提取验证集特征
+        print(f"  提取验证集特征...")
+        val_features, _ = extract_features(model_to_load, val_loader, Config.DEVICE)
 
-    # 搜索最佳阈值
-    best_threshold, best_accuracy = search_best_threshold(
-        val_dataset,
-        val_features,
-        threshold_range=Config.THRESHOLD_RANGE
-    )
+        # 搜索最佳阈值
+        best_threshold, best_accuracy = search_best_threshold(
+            val_dataset,
+            val_features,
+            threshold_range=Config.THRESHOLD_RANGE
+        )
+
+        # 保存用于推理的最终模型
+        models = [model_to_load]
 
     # ========== 阶段 3：生成提交 ==========
 
@@ -1020,15 +1149,41 @@ def main():
     # 读取测试数据
     test_pairs = load_test_csv(Config.TEST_CSV)
 
-    # 生成预测
-    predictions = generate_submission(
-        model=model_to_load,
-        test_dir=Config.TEST_DIR,
-        test_pairs=test_pairs,
-        best_threshold=best_threshold,
-        device=Config.DEVICE,
-        use_tta=True
-    )
+    # 对于 K-Fold，使用集成模型投票
+    if Config.USE_KFOLD:
+        print(f"  使用 {len(models)} 个模型进行集成预测...")
+        all_predictions = []
+        for fold_idx, model in enumerate(models):
+            model_to_load = model.module if hasattr(model, 'module') else model
+            model_to_load.eval()
+            predictions = generate_submission(
+                model=model_to_load,
+                test_dir=Config.TEST_DIR,
+                test_pairs=test_pairs,
+                best_threshold=best_thresholds[fold_idx],
+                device=Config.DEVICE,
+                use_tta=True
+            )
+            all_predictions.append(predictions)
+
+        # 集成投票：多数投票
+        ensemble_predictions = []
+        for pred_idx in range(len(test_pairs)):
+            votes = [all_predictions[fold][pred_idx] for fold in range(len(models))]
+            ensemble_pred = 1 if sum(votes) > len(models) / 2 else 0
+            ensemble_predictions.append(ensemble_pred)
+        predictions = ensemble_predictions
+    else:
+        # 单模型预测
+        model_to_load = models[0]
+        predictions = generate_submission(
+            model=model_to_load,
+            test_dir=Config.TEST_DIR,
+            test_pairs=test_pairs,
+            best_threshold=best_threshold,
+            device=Config.DEVICE,
+            use_tta=True
+        )
 
     # 保存提交文件
     save_submission(
@@ -1043,6 +1198,8 @@ def main():
     print(f"提交文件: {Config.SUBMISSION_PATH}")
     print(f"最佳阈值: {best_threshold:.3f}")
     print(f"验证集准确率: {best_accuracy:.4f}")
+    if Config.USE_KFOLD:
+        print(f"训练模式: K-Fold ({Config.NUM_FOLDS}-Fold) 集成")
 
 
 if __name__ == '__main__':
