@@ -63,7 +63,7 @@ class Config:
     NUM_FOLDS = 5     # K-Fold 数量
 
     # 模型参数
-    INPUT_SIZE = 224
+    INPUT_SIZE = 320  # 从 224 增大到 320，保留更多细节（牛脸纹理）
     NUM_CLASSES = None  # 将在数据加载时动态设置
 
     # ArcFace 参数
@@ -352,16 +352,39 @@ class CowFaceModel(nn.Module):
 # 数据增强
 # ============================================================================
 
-def get_train_transforms(input_size: int = 224) -> transforms.Compose:
-    """训练集数据增强
+def get_train_transforms(input_size: int = 320) -> transforms.Compose:
+    """训练集数据增强 - 强化版
 
-    包含：resize -> random crop -> horizontal flip -> color jitter -> normalization
+    包含：
+    - Resize + RandomResizedCrop（保持宽高比的随机裁剪）
+    - RandomRotation（几何变换）
+    - RandomHorizontalFlip（水平翻转）
+    - ColorJitter（颜色抖动，强化版）
+    - RandomAffine（随机仿射变换）
+    - GaussianBlur（高斯模糊）
+    - Normalization
     """
     return transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.RandomCrop(input_size),
+        transforms.Resize(int(input_size * 1.15)),  # 320 -> 368
+        transforms.RandomRotation(degrees=15),  # 新增：旋转 [-15, 15] 度
+        transforms.RandomResizedCrop(
+            input_size,
+            scale=(0.85, 1.0),  # 裁剪比例
+            ratio=(0.9, 1.1)    # 宽高比范围
+        ),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        transforms.ColorJitter(
+            brightness=0.3,   # 增强从 0.2 -> 0.3
+            contrast=0.3,     # 增强从 0.2 -> 0.3
+            saturation=0.3,   # 增强从 0.2 -> 0.3
+            hue=0.1           # 新增：色调调整
+        ),
+        transforms.RandomAffine(
+            degrees=0,
+            translate=(0.1, 0.1),  # 新增：随机平移 ±10%
+            scale=(0.95, 1.05)     # 新增：随机缩放
+        ),
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.2)),  # 新增：高斯模糊
         transforms.ToTensor(),
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
@@ -370,7 +393,7 @@ def get_train_transforms(input_size: int = 224) -> transforms.Compose:
     ])
 
 
-def get_test_transforms(input_size: int = 224) -> transforms.Compose:
+def get_test_transforms(input_size: int = 320) -> transforms.Compose:
     """测试集数据增强
 
     只包含：resize -> normalization
