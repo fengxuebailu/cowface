@@ -467,6 +467,9 @@ def train_epoch(model: nn.Module,
     total_loss = 0.0
     num_batches = 0
 
+    # 在开始前清零梯度
+    optimizer.zero_grad()
+
     pbar = tqdm(dataloader, desc='训练中', leave=False)
     for batch_idx, batch in enumerate(pbar):
         images = batch['image'].to(device)
@@ -491,7 +494,7 @@ def train_epoch(model: nn.Module,
         num_batches += 1
         pbar.set_postfix({
             'loss': f"{loss.item() * accumulation_steps:.4f}",
-            'accum': f"{(batch_idx + 1) % accumulation_steps}/{accumulation_steps}"
+            'accum': f"{(batch_idx + 1) % accumulation_steps + 1}/{accumulation_steps}"
         })
 
     avg_loss = total_loss / max(num_batches, 1)
